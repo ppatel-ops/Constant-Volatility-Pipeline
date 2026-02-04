@@ -244,6 +244,36 @@ def weekly_atm_iv(weekly_options, spot_price, valuation_date, r=0):
     }
 
 
+def validate_atm_strike(user_legs, weekly_opts, spot_price):
+    """
+    Validate that the first leg is close to ATM (within reasonable range)
+    Returns: (is_valid, distance_from_atm)
+    """
+    first_leg = user_legs[0]
+    user_atm_strike = first_leg["strike"]
+    
+    # Get the actual ATM from options data
+    atm_ce, atm_pe = get_atm_options(weekly_opts, spot_price)
+    actual_atm = atm_ce["StrkPric"]
+    
+    distance = abs(user_atm_strike - actual_atm)
+    
+    # Allow up to ±1 strike away from computed ATM
+    is_valid = distance <= 100  # typically 1 strike = 100 points for NIFTY
+    
+    print(f"[*] User-specified ATM strike: {user_atm_strike}")
+    print(f"[*] Computed ATM strike:       {actual_atm}")
+    print(f"[*] Distance:                  {distance} points")
+    
+    if is_valid:
+        print(f"✅ ATM strike validation passed")
+    else:
+        print(f"⚠️  WARNING: First strike {user_atm_strike} is not very close to ATM {actual_atm}")
+    
+    return is_valid, distance
+
+
+
 def get_dynamic_user_input():
     """
     Collect user inputs dynamically through interactive prompts
@@ -336,6 +366,10 @@ def get_dynamic_user_input():
     for leg_num in range(1, num_legs + 1):
         print(f"\n{'─' * 60}")
         print(f"LEG {leg_num}")
+        if leg_num == 1:
+            print(f"[ATM Strike - IV Reference]")
+        else:
+            print(f"[OTM Strike]")
         print(f"{'─' * 60}")
 
         # Strike Price
@@ -484,10 +518,51 @@ def main():
         print(f"CRITICAL ERROR fetching data: {e}")
         sys.exit(1)
 
-    # --- 3. Calculate ATM Implied Volatility ---
+    # --- 3. Calculate ATM Implied Volatility from First Leg (User Input) ---
     try:
         print("[*] Calculating ATM Implied Volatility...")
-        iv_result = weekly_atm_iv(weekly_opts, spot_price, iv_ref_date, user_input["risk_free_rate"])
+        
+        # Validate that the first leg is the ATM strike
+        print("[*] Validating user-specified ATM strike...")
+        validate_atm_strike(user_input["legs"], weekly_opts, spot_price)
+        
+        # Get ATM strike from first leg (user input)
+        atm_strike_from_user = user_input["legs"][0]["strike"]
+        atm_option_type = user_input["legs"][0]["type"]
+        
+        print(f"[*] Using ATM Strike from user input: {atm_strike_from_user} ({atm_option_type})")
+        
+        # Get the ATM option from weekly options data to calculate IV
+        atm_option = weekly_opts[
+            (weekly_opts["StrkPric"] == atm_strike_from_user) &
+            (weekly_opts["OptnTp"] == atm_option_type)
+        ]
+        
+        if atm_option.empty:
+            print(f"⚠️ WARNING: ATM strike {atm_strike_from_user} {atm_option_type} not found in options data.")
+            print("Falling back to automatic ATM detection...")
+            iv_result = weekly_atm_iv(weekly_opts, spot_price, iv_ref_date, user_input["risk_free_rate"])
+            atm_strike_from_user = iv_result['ATM Strike']
+        else:
+            atm_option = atm_option.iloc[0]
+            expiry = pd.to_datetime(atm_option["XpryDt"])
+            T = compute_ttm(iv_ref_date, expiry.date())
+            
+            # Calculate IV for the user-specified ATM strike
+            atm_iv = implied_vol(
+                atm_option["ClsPric"], spot_price,
+                atm_strike_from_user, T, user_input["risk_free_rate"], atm_option_type
+            )
+            
+            if atm_iv is None:
+                atm_iv = 0.12
+            
+            iv_result = {
+                "Expiry": expiry,
+                "TTM": T,
+                "ATM Strike": atm_strike_from_user,
+                "ATM IV": atm_iv
+            }
         
         expiry = pd.to_datetime(iv_result["Expiry"])
         atm_iv = iv_result["ATM IV"]
@@ -529,6 +604,9 @@ def main():
         S0 = spot_price
         T = iv_result["TTM"]  # Use the TTM already calculated (accounts for holidays, weekends, etc)
         sigma = atm_iv
+        
+        print(f"[*] Using constant IV assumption: {sigma:.4f} (from ATM strike {iv_result['ATM Strike']})")
+        print(f"[*] IV applied to all legs in the strategy")
 
         spots, pnls = pnl_curve(S0, legs_with_premium, T, sigma, user_input["risk_free_rate"])
 
